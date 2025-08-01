@@ -1,12 +1,13 @@
 import streamlit as st
-import subprocess
-import sys
+import speech_recognition as sr
 import tempfile
 import os
 import io
 import numpy as np
 import time
 from pathlib import Path
+import subprocess
+import sys
 
 # Função para instalar pacotes automaticamente
 def install_package(package):
@@ -15,9 +16,9 @@ def install_package(package):
 # Verificação e instalação automática de dependências
 def check_and_install_dependencies():
     required_packages = {
-        'whisper': 'openai-whisper',
+        'speech_recognition': 'SpeechRecognition',
         'pydub': 'pydub',
-        'torch': 'torch',
+        'pyaudio': 'pyaudio',
     }
     
     missing_packages = []
@@ -31,11 +32,18 @@ def check_and_install_dependencies():
         with st.spinner(f"Instalando dependências: {', '.join(missing_packages)}..."):
             for package in missing_packages:
                 try:
-                    install_package(package)
+                    if package == 'pyaudio':
+                        # PyAudio pode ser problemático no Windows, tenta alternativa
+                        try:
+                            install_package('pyaudio')
+                        except:
+                            st.warning("PyAudio não instalado - algumas funcionalidades podem ser limitadas")
+                            continue
+                    else:
+                        install_package(package)
                     st.success(f"✅ {package} instalado com sucesso!")
                 except Exception as e:
                     st.error(f"❌ Erro ao instalar {package}: {str(e)}")
-                    return False
         st.rerun()
     return True
 
@@ -45,70 +53,123 @@ if not check_and_install_dependencies():
 
 # Agora importa os módulos necessários
 try:
-    import whisper
     from pydub import AudioSegment
-    import torch
+    from pydub.silence import split_on_silence
 except ImportError as e:
-    st.error(f"Erro ao importar módulos: {str(e)}")
+    st.error(f"Erro ao importar módulos de áudio: {str(e)}")
     st.stop()
 
 # Configuração da página
 st.set_page_config(
-    page_title="Transcritor de Áudio",
+    page_title="Transcritor de Áudio Robusto",
     page_icon="🎤",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Cache do modelo para evitar recarregamento
+# Cache do reconhecedor para evitar recarregamento
 @st.cache_resource
-def load_whisper_model(model_size):
-    """Carrega o modelo Whisper especificado"""
-    try:
-        model = whisper.load_model(model_size)
-        return model
-    except Exception as e:
-        st.error(f"Erro ao carregar modelo: {str(e)}")
-        return None
+def get_speech_recognizer():
+    """Inicializa o reconhecedor de fala"""
+    return sr.Recognizer()
 
-def convert_audio_format(audio_file, target_format="wav"):
-    """Converte áudio para formato compatível"""
+def convert_audio_to_wav(audio_file):
+    """Converte áudio para formato WAV compatível"""
     try:
         # Lê o arquivo de áudio
         audio = AudioSegment.from_file(audio_file)
         
-        # Converte para mono e 16kHz (otimizado para Whisper)
+        # Converte para mono e taxa de amostragem padrão
         audio = audio.set_channels(1).set_frame_rate(16000)
         
         # Salva em formato temporário
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{target_format}") as tmp_file:
-            audio.export(tmp_file.name, format=target_format)
-            return tmp_file.name
-    except Exception as e:
-        # Fallback: tenta usar o arquivo original se a conversão falhar
-        st.warning(f"Conversão falhou, usando arquivo original: {str(e)}")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-            tmp_file.write(audio_file.getvalue() if hasattr(audio_file, 'getvalue') else audio_file.read())
-            return tmp_file.name
-
-def transcribe_audio(model, audio_path, language=None, task="transcribe"):
-    """Transcreve o áudio usando Whisper"""
-    try:
-        # Opções de transcrição
-        options = {
-            "task": task,
-            "fp16": torch.cuda.is_available(),  # Usa FP16 se GPU disponível
-        }
-        
-        if language and language != "auto":
-            options["language"] = language
-            
-        # Realiza a transcrição
-        result = model.transcribe(audio_path, **options)
-        return result
+            audio.export(tmp_file.name, format="wav")
+            return tmp_file.name, len(audio) / 1000.0  # duração em segundos
     except Exception as e:
-        st.error(f"Erro na transcrição: {str(e)}")
-        return None
+        st.error(f"Erro na conversão de áudio: {str(e)}")
+        return None, 0
+
+def transcribe_with_google(recognizer, audio_file, language="pt-BR"):
+    """Transcreve usando Google Speech Recognition (gratuito)"""
+    try:
+        with sr.AudioFile(audio_file) as source:
+            audio_data = recognizer.record(source)
+        
+        # Tenta transcrever
+        text = recognizer.recognize_google(audio_data, language=language)
+        return text, "Google Speech Recognition"
+    except sr.UnknownValueError:
+        return "Não foi possível entender o áudio", "Google Speech Recognition"
+    except sr.RequestError as e:
+        return f"Erro na solicitação: {str(e)}", "Google Speech Recognition"
+    except Exception as e:
+        return f"Erro: {str(e)}", "Google Speech Recognition"
+
+def transcribe_with_sphinx(recognizer, audio_file):
+    """Transcreve usando PocketSphinx (offline)"""
+    try:
+        with sr.AudioFile(audio_file) as source:
+            audio_data = recognizer.record(source)
+        
+        text = recognizer.recognize_sphinx(audio_data)
+        return text, "PocketSphinx (Offline)"
+    except sr.UnknownValueError:
+        return "Não foi possível entender o áudio", "PocketSphinx (Offline)"
+    except Exception as e:
+        return f"Erro: {str(e)}", "PocketSphinx (Offline)"
+
+def transcribe_large_audio(recognizer, audio_file, engine="google", language="pt-BR", chunk_length=30):
+    """Transcreve áudios longos dividindo em chunks"""
+    try:
+        # Carrega o áudio
+        audio = AudioSegment.from_wav(audio_file)
+        
+        # Divide em chunks de silêncio ou por tempo
+        chunks = split_on_silence(
+            audio,
+            min_silence_len=1000,  # 1 segundo de silêncio
+            silence_thresh=audio.dBFS-14,
+            keep_silence=500,
+        )
+        
+        # Se não conseguiu dividir por silêncio, divide por tempo
+        if len(chunks) == 1:
+            chunk_length_ms = chunk_length * 1000
+            chunks = [audio[i:i+chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
+        
+        transcriptions = []
+        progress_bar = st.progress(0)
+        
+        for i, chunk in enumerate(chunks):
+            # Salva chunk temporário
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_chunk:
+                chunk.export(tmp_chunk.name, format="wav")
+                
+                # Transcreve chunk
+                if engine == "google":
+                    text, _ = transcribe_with_google(recognizer, tmp_chunk.name, language)
+                else:
+                    text, _ = transcribe_with_sphinx(recognizer, tmp_chunk.name)
+                
+                if text and text != "Não foi possível entender o áudio":
+                    transcriptions.append({
+                        'chunk': i + 1,
+                        'start_time': i * chunk_length,
+                        'text': text.strip()
+                    })
+                
+                # Limpa arquivo temporário
+                os.unlink(tmp_chunk.name)
+                
+                # Atualiza progresso
+                progress_bar.progress((i + 1) / len(chunks))
+        
+        return transcriptions, engine.title()
+        
+    except Exception as e:
+        st.error(f"Erro na transcrição de áudio longo: {str(e)}")
+        return [], engine.title()
 
 def format_timestamp(seconds):
     """Formata timestamp em formato legível"""
@@ -119,51 +180,62 @@ def format_timestamp(seconds):
 
 def main():
     st.title("🎤 Transcritor de Áudio Robusto")
-    st.markdown("### Transcrição precisa usando Whisper (OpenAI)")
+    st.markdown("### Transcrição usando SpeechRecognition (Google + PocketSphinx)")
     
     # Sidebar com configurações
     with st.sidebar:
         st.header("⚙️ Configurações")
         
-        # Seleção do modelo
-        model_size = st.selectbox(
-            "Modelo Whisper:",
-            ["tiny", "base", "small", "medium", "large"],
-            index=2,
-            help="Modelos maiores são mais precisos, mas mais lentos"
+        # Engine de reconhecimento
+        engine = st.selectbox(
+            "Engine de Reconhecimento:",
+            ["google", "sphinx"],
+            index=0,
+            format_func=lambda x: {
+                "google": "🌐 Google Speech (Online)",
+                "sphinx": "💻 PocketSphinx (Offline)"
+            }[x],
+            help="Google é mais preciso mas requer internet. PocketSphinx funciona offline."
         )
         
-        # Idioma
-        languages = {
-            "auto": "Detecção Automática",
-            "pt": "Português",
-            "en": "Inglês",
-            "es": "Espanhol",
-            "fr": "Francês",
-            "de": "Alemão",
-            "it": "Italiano",
-            "ja": "Japonês",
-            "ko": "Coreano",
-            "zh": "Chinês"
-        }
+        # Idioma (apenas para Google)
+        if engine == "google":
+            languages = {
+                "pt-BR": "🇧🇷 Português (Brasil)",
+                "pt-PT": "🇵🇹 Português (Portugal)", 
+                "en-US": "🇺🇸 Inglês (EUA)",
+                "es-ES": "🇪🇸 Espanhol",
+                "fr-FR": "🇫🇷 Francês",
+                "de-DE": "🇩🇪 Alemão",
+                "it-IT": "🇮🇹 Italiano",
+                "ja-JP": "🇯🇵 Japonês",
+                "ko-KR": "🇰🇷 Coreano",
+                "zh-CN": "🇨🇳 Chinês"
+            }
+            
+            selected_language = st.selectbox(
+                "Idioma do áudio:",
+                list(languages.keys()),
+                format_func=lambda x: languages[x]
+            )
+        else:
+            selected_language = "en-US"
+            st.info("💡 PocketSphinx suporta principalmente inglês")
         
-        selected_language = st.selectbox(
-            "Idioma do áudio:",
-            list(languages.keys()),
-            format_func=lambda x: languages[x]
-        )
-        
-        # Tipo de tarefa
-        task = st.radio(
-            "Tarefa:",
-            ["transcribe", "translate"],
-            format_func=lambda x: "Transcrever" if x == "transcribe" else "Traduzir para inglês"
+        # Configurações para áudios longos
+        st.subheader("📏 Áudios Longos")
+        chunk_length = st.slider(
+            "Tamanho dos chunks (segundos):",
+            min_value=10,
+            max_value=60,
+            value=30,
+            help="Divide áudios longos em partes menores"
         )
         
         # Opções de saída
         st.subheader("📄 Opções de Saída")
+        show_chunks = st.checkbox("Mostrar chunks separados", value=True)
         show_timestamps = st.checkbox("Mostrar timestamps", value=True)
-        show_confidence = st.checkbox("Mostrar nível de confiança", value=False)
         
     # Interface principal
     col1, col2 = st.columns([1, 1])
@@ -191,77 +263,77 @@ def main():
     with col2:
         st.subheader("🔄 Status da Transcrição")
         
+        # Informações do engine selecionado
+        if engine == "google":
+            st.info("🌐 **Google Speech Recognition**\n- Alta precisão\n- Requer internet\n- Suporte multilíngue")
+        else:
+            st.info("💻 **PocketSphinx**\n- Funciona offline\n- Boa para inglês\n- Sem limites de uso")
+        
         if uploaded_file:
             if st.button("🚀 Iniciar Transcrição", type="primary"):
-                # Barra de progresso
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+                # Inicializa recognizer
+                recognizer = get_speech_recognizer()
                 
                 try:
-                    # Carrega o modelo
-                    status_text.text("Carregando modelo Whisper...")
-                    progress_bar.progress(20)
-                    model = load_whisper_model(model_size)
-                    
-                    if model is None:
-                        st.error("Falha ao carregar o modelo")
-                        return
-                    
-                    # Converte o áudio
-                    status_text.text("Processando áudio...")
-                    progress_bar.progress(40)
-                    
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                        tmp_file.write(uploaded_file.getvalue())
-                        converted_path = convert_audio_format(tmp_file.name)
+                    # Converte áudio
+                    with st.spinner("Processando áudio..."):
+                        converted_path, duration = convert_audio_to_wav(uploaded_file)
                     
                     if converted_path is None:
                         st.error("Falha na conversão do áudio")
                         return
                     
-                    # Transcreve
-                    status_text.text("Transcrevendo áudio...")
-                    progress_bar.progress(60)
+                    st.info(f"Duração do áudio: {duration:.1f} segundos")
                     
+                    # Decide estratégia baseada na duração
                     start_time = time.time()
-                    result = transcribe_audio(
-                        model, 
-                        converted_path, 
-                        language=selected_language if selected_language != "auto" else None,
-                        task=task
-                    )
+                    
+                    if duration > chunk_length:
+                        st.info(f"Áudio longo detectado. Dividindo em chunks de {chunk_length}s...")
+                        transcriptions, engine_used = transcribe_large_audio(
+                            recognizer, converted_path, engine, selected_language, chunk_length
+                        )
+                        
+                        # Processa resultados
+                        if transcriptions:
+                            full_text = " ".join([t['text'] for t in transcriptions])
+                        else:
+                            full_text = "Não foi possível transcrever o áudio"
+                            
+                    else:
+                        st.info("Áudio curto. Transcrevendo diretamente...")
+                        if engine == "google":
+                            full_text, engine_used = transcribe_with_google(recognizer, converted_path, selected_language)
+                        else:
+                            full_text, engine_used = transcribe_with_sphinx(recognizer, converted_path)
+                        
+                        transcriptions = [{
+                            'chunk': 1,
+                            'start_time': 0,
+                            'text': full_text
+                        }] if full_text != "Não foi possível entender o áudio" else []
+                    
                     end_time = time.time()
                     
-                    if result is None:
-                        st.error("Falha na transcrição")
-                        return
-                    
-                    progress_bar.progress(100)
-                    status_text.text("✅ Transcrição concluída!")
-                    
-                    # Limpa arquivos temporários
+                    # Limpa arquivo temporário
                     os.unlink(converted_path)
                     
                     # Exibe resultados
                     st.success(f"Transcrição concluída em {end_time - start_time:.2f} segundos")
-                    
-                    # Idioma detectado
-                    if "language" in result:
-                        detected_lang = result["language"]
-                        st.info(f"Idioma detectado: {detected_lang}")
+                    st.info(f"Engine usado: {engine_used}")
                     
                 except Exception as e:
                     st.error(f"Erro durante a transcrição: {str(e)}")
                     return
     
     # Área de resultados
-    if uploaded_file and 'result' in locals():
+    if uploaded_file and 'transcriptions' in locals() and transcriptions:
         st.markdown("---")
         st.subheader("📝 Resultado da Transcrição")
         
         # Texto completo
         with st.expander("📄 Texto Completo", expanded=True):
-            full_text = result["text"].strip()
+            full_text = " ".join([t['text'] for t in transcriptions])
             st.text_area("", value=full_text, height=200, key="full_text")
             
             # Botão de download
@@ -272,55 +344,66 @@ def main():
                 mime="text/plain"
             )
         
-        # Segmentos com timestamps
-        if show_timestamps and "segments" in result:
-            with st.expander("⏱️ Transcrição com Timestamps"):
-                for i, segment in enumerate(result["segments"]):
-                    start_time = format_timestamp(segment["start"])
-                    end_time = format_timestamp(segment["end"])
-                    text = segment["text"].strip()
-                    
-                    if show_confidence and "avg_logprob" in segment:
-                        # Converte log probability para porcentagem aproximada
-                        confidence = np.exp(segment["avg_logprob"]) * 100
-                        st.write(f"**[{start_time} - {end_time}]** ({confidence:.1f}%): {text}")
+        # Chunks com timestamps
+        if show_chunks and len(transcriptions) > 1:
+            with st.expander("📋 Transcrição por Chunks"):
+                for t in transcriptions:
+                    if show_timestamps:
+                        start_time = format_timestamp(t['start_time'])
+                        st.write(f"**Chunk {t['chunk']} [{start_time}]**: {t['text']}")
                     else:
-                        st.write(f"**[{start_time} - {end_time}]**: {text}")
+                        st.write(f"**Chunk {t['chunk']}**: {t['text']}")
         
         # Estatísticas
-        if "segments" in result:
-            with st.expander("📊 Estatísticas"):
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Duração Total", f"{len(result['segments'])} segmentos")
-                
-                with col2:
-                    total_duration = result["segments"][-1]["end"] if result["segments"] else 0
-                    st.metric("Duração", f"{total_duration:.1f}s")
-                
-                with col3:
-                    word_count = len(full_text.split())
-                    st.metric("Palavras", word_count)
+        with st.expander("📊 Estatísticas"):
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Total de Chunks", len(transcriptions))
+            
+            with col2:
+                if 'duration' in locals():
+                    st.metric("Duração", f"{duration:.1f}s")
+            
+            with col3:
+                word_count = len(full_text.split())
+                st.metric("Palavras", word_count)
+    
+    elif uploaded_file and 'transcriptions' in locals() and not transcriptions:
+        st.warning("Não foi possível transcrever o áudio. Tente:")
+        st.markdown("- Verificar a qualidade do áudio")
+        st.markdown("- Usar um engine diferente")
+        st.markdown("- Ajustar o tamanho dos chunks")
 
     # Informações sobre o sistema
     with st.sidebar:
         st.markdown("---")
-        st.subheader("ℹ️ Informações do Sistema")
+        st.subheader("ℹ️ Informações")
         
-        # Verifica GPU
-        if torch.cuda.is_available():
-            st.success("🚀 GPU disponível (CUDA)")
-            st.write(f"GPU: {torch.cuda.get_device_name()}")
-        else:
-            st.info("💻 Usando CPU")
+        st.markdown("**Engines Disponíveis:**")
+        st.markdown("- 🌐 **Google Speech**: Alta precisão, requer internet")
+        st.markdown("- 💻 **PocketSphinx**: Offline, ideal para inglês")
         
         st.markdown("---")
-        st.markdown("**Tecnologias utilizadas:**")
-        st.markdown("- 🤖 OpenAI Whisper")
+        st.markdown("**Tecnologias:**")
+        st.markdown("- 🎤 SpeechRecognition")
         st.markdown("- 🎵 PyDub para processamento")
-        st.markdown("- 🔥 PyTorch para ML")
         st.markdown("- 🌟 Streamlit para interface")
+        
+        # Dicas
+        with st.expander("💡 Dicas de Uso"):
+            st.markdown("""
+            **Para melhor precisão:**
+            - Use áudios com boa qualidade
+            - Evite ruído de fundo
+            - Fale claramente
+            - Use Google Speech quando possível
+            
+            **Para áudios longos:**
+            - Ajuste o tamanho dos chunks
+            - Use chunks menores para fala rápida
+            - Chunks maiores para fala pausada
+            """)
 
 if __name__ == "__main__":
     main()
