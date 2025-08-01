@@ -1,6 +1,6 @@
-streamlit>=1.28.0
-SpeechRecognition>=3.10.0
-pydub>=0.25.1
-numpy>=1.24.0
-pyaudio>=0.2.11
-pocketsphinx>=0.1.15
+streamlit
+SpeechRecognition
+pydub
+numpy
+pyaudio
+pocketsphinx
